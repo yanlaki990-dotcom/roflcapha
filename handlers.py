@@ -65,6 +65,20 @@ async def _send_captcha(bot: Bot, chat_id: int, user_id: int, name: str, scope: 
     asyncio.create_task(_timeout_task(bot, chat_id, user_id, msg.message_id))
 
 
+async def _start_captcha(bot: Bot, chat_id: int, user_id: int, name: str, scope: str):
+    """Запустить капчу, снеся старую активную (если была)."""
+    key = _key(chat_id, user_id)
+    old = storage.pending.get(key)
+    if old and old.get("message_id"):
+        try:
+            await bot.delete_message(old["chat_id"], old["message_id"])
+        except Exception:
+            pass
+        storage.pending.pop(key, None)
+        storage.save()
+    await _send_captcha(bot, chat_id, user_id, name, scope)
+
+
 async def _timeout_task(bot: Bot, chat_id: int, user_id: int, message_id: int):
     await asyncio.sleep(CAPTCHA_TIMEOUT)
     key = _key(chat_id, user_id)
@@ -92,14 +106,31 @@ async def _timeout_task(bot: Bot, chat_id: int, user_id: int, message_id: int):
             pass
     else:
         try:
-            await bot.send_message(chat_id, "⏱ Время вышло. Напиши /start, чтобы попробовать снова.")
+            await bot.send_message(
+                chat_id,
+                "⏱ Время вышло. Напиши любое сообщение, чтобы получить новую капчу.",
+            )
         except Exception:
             pass
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
-    await _send_captcha(
+    await _start_captcha(
+        bot, message.chat.id, message.from_user.id,
+        message.from_user.full_name, "private",
+    )
+
+
+# НОВОЕ: любое текстовое сообщение в личке → новая капча, если активной нет
+@router.message(F.chat.type == "private", F.text)
+async def on_private_text(message: Message, bot: Bot):
+    if message.text.startswith("/"):
+        return  # команды пропускаем
+    key = _key(message.chat.id, message.from_user.id)
+    if key in storage.pending:
+        return  # уже есть активная капча — не спамим
+    await _start_captcha(
         bot, message.chat.id, message.from_user.id,
         message.from_user.full_name, "private",
     )
@@ -118,7 +149,7 @@ async def on_new_members(message: Message, bot: Bot):
             )
         except Exception as e:
             log.warning(f"mute failed: {e} (бот админ с правом ограничивать?)")
-        await _send_captcha(bot, message.chat.id, member.id, member.full_name, "group")
+        await _start_captcha(bot, message.chat.id, member.id, member.full_name, "group")
 
 
 @router.callback_query(F.data.startswith("cap:"))
@@ -142,11 +173,12 @@ async def on_answer(callback: CallbackQuery, bot: Bot):
         storage.pending.pop(key, None)
         storage.save()
         phrase = rofl.success_phrase()
+        hint = "Напиши любое сообщение, чтобы пройти ещё одну." if data["scope"] == "private" else ""
+        text = f"✅ <b>{callback.from_user.full_name}</b> — человек. {phrase}"
+        if hint:
+            text += f"\n\n{hint}"
         try:
-            await callback.message.edit_text(
-                f"✅ <b>{callback.from_user.full_name}</b> — человек. {phrase}",
-                reply_markup=None,
-            )
+            await callback.message.edit_text(text, reply_markup=None)
         except Exception:
             pass
         await callback.answer(phrase)
@@ -191,6 +223,14 @@ async def on_answer(callback: CallbackQuery, bot: Bot):
                 await bot.unban_chat_member(data["chat_id"], data["user_id"])
             except Exception as e:
                 log.warning(f"kick failed: {e}")
+        else:
+            try:
+                await bot.send_message(
+                    data["chat_id"],
+                    "Напиши любое сообщение, чтобы попробовать ещё раз.",
+                )
+            except Exception:
+                pass
     else:
         storage.save()
         left = MAX_ATTEMPTS - data["attempts"]
